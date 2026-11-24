@@ -1,0 +1,39 @@
+name: iOS 壳（拉伸铺满补丁）
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "graphics/**"
+      - "ios/**"
+      - "launchers/**"
+      - ".github/workflows/ios-build.yml"
+
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选定 Xcode
+        run: |
+          ls /Applications | grep -i xcode || true
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: 编译 iOS 壳（未签名）
+        run: make ios -j"$(sysctl -n hw.ncpu)"
+
+      - name: 打包 .app
+        run: |
+          test -d build/ios/S2Arm.app
+          ditto -c -k --sequesterRsrc --keepParent build/ios/S2Arm.app "$GITHUB_WORKSPACE/S2Arm-ios-unsigned.zip"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: S2Arm-ios-unsigned
+          path: S2Arm-ios-unsigned.zip
+          if-no-files-found: error
