@@ -96,8 +96,13 @@ static _Atomic int g_geo_bad, g_geo_pin_req; static int g_fit_geo; static char g
 // 不在宽屏已验证名单的款（10-26 维护者：一律 16:9 原比例加黑边，runtime/src/widen.c widen_verified）：原生层屏幕宽按 1920，左右黑边是设计如此，几何不报。
 //   原生层判定时设 S2A_WIDEN_NARROW=1（本层不链原生层符号：iOS 链接不收未定义的弱引用）
 static int fit_narrow(void) { const char *e = getenv("S2A_WIDEN_NARROW"); return e && !strcmp(e, "1"); }
+// 拉伸铺满（S2A_STRETCH=1，launch.json stretchToFill）：不管游戏给的 ImageCrop 比例，上屏一律拉满整块图层（比例不对就变形）。
+//   落点在定格这一下（sl->stretched）：上屏 dst_rect 与触屏层（vpad.m 的 nxgal_present_frame）读的是同一个值，
+//   触点跟着一起铺满，不会出现「画面拉满了、触点还按信箱矩形算」的错位。
+static int force_stretch(void) { const char *e = getenv("S2A_STRETCH"); return e && e[0] == '1'; }
 static void fit_geom(int sw, int sh, int iw, int ih, irect r, int stretched) {
     char why[160] = "";
+    if (force_stretch()) { atomic_store(&g_geo_bad, 0); fit_note(0, 0, why); return; }   // 拉伸档：变形是玩家明确选的，几何判据让开，免得被自检退回 16:9
     if (fit_narrow() && !stretched) { atomic_store(&g_geo_bad, 0); fit_note(0, 0, why); return; }
     if (r.w < sw - 2) snprintf(why, sizeof why, "画面 %dx%d 上屏只占 %d / %d 像素宽（左右留边）", iw, ih, r.w, sw);
     else if (stretched && fabs((double)iw * sh - (double)sw * ih) > 0.01 * (double)sw * ih) snprintf(why, sizeof why, "画面 %dx%d 拉伸到屏幕 %dx%d（宽高比 %.3f → %.3f，变形）", iw, ih, sw, sh, (double)iw / ih, (double)sw / sh);
@@ -207,44 +212,6 @@ static int present_hdr_uv(float p[8], MTLPixelFormat dst_pf, int layer_path) {
 }
 
 // ---------- 着色器 ----------
-// PR-A（#625 第二阶段）：present_itm 的 MSL 文本——S4「SDR 转 HDR」扩张曲线（ITU-R BT.2446-1 §4.2〔Method A〕逆色调
-//   映射通用解析式，设计稿 §2.2 逐段转写；手写 MSL——公式源自 ITU 免费标准文本，未复制 gamescope/libplacebo 任何代码
-//   文本，登记 THIRD_PARTY_LICENSES.md）。k_present_msl（pr_fs_hdr 的 fs 源）与单测独立判据
-//   （graphics/metal/tests/t_present_hdr.m ⑦ 的探针着色器，经独立导出的 k_present_itm_msl 取同一份文本）共用——
-//   与直连副本 nvn_mtl.m 同式（「数学逐条对齐……两处同改」惯例，K_PRESENT_ITM_MSL 同款宏化）。
-//   不用 Table 4 快速路径：target 由设置+净空推导，非 100→1000 设计点。
-//   勘误登记（上游评审 PR #2080 第 1 轮自 THIRD_PARTY_LICENSES.md 挪入——本仓无单测佐证的技术勘误不进对外出处声明）：
-//   gamescope 的 Table 4 快速路径常数 c2 误写 1.2328（正确 1.2528——ITU-R BT.2446-1 Table 4〔第 12 页〕官方原文；
-//   libplacebo 的 Table 4 形逆同用 1.2528，两处独立源互证）。本仓用通用解析式、不走 Table 4，不受该笔误影响——
-//   复核者若拿 gamescope 的 Table 4 常数对拍会踩坑，登记于此。
-//   入 n：线性光（BT.2020 基色，1.0 = sdr_nits）；出：线性光（1.0 = target_nits——调用侧乘 target/纸白 喂 present_linear_to_pq）。
-#define K_GAL_ITM_MSL \
-"static inline float3 present_itm(float3 n, float sdr_nits, float target_nits) {\n" \
-"  const float3 k2020 = float3(0.262698338956556, 0.678008765772817, 0.0592928952706273);   // BT.2020 亮度系数（gamescope 同值）\n" \
-"  const float kR = 1.47460332208689, kB = 1.88141420945875;   // 2 − 2·k2020.r / 2 − 2·k2020.b\n" \
-"  n = pow(max(n, float3(0.0)), float3(1.0 / 2.4));   // γ 压缩（线性 → 码值域）\n" \
-"  float y = dot(n, k2020);   // Y'tmo（BT.2020 亮度变换）\n" \
-"  float cb = (n.b - y) / kB, cr = (n.r - y) / kR;   // C'b / C'r\n" \
-"  float y_sdr = y + max(0.1 * cr, 0.0);   // 亮度调整（逆）：Y'sdr = Y'tmo + max(0.1·C'r, 0)\n" \
-"  float p_sdr = 1.0 + 32.0 * pow(sdr_nits / 10000.0, 1.0 / 2.4);\n" \
-"  float y_c = log(y_sdr * (p_sdr - 1.0) + 1.0) / log(p_sdr);   // psdr 归一\n" \
-"  float y_p0 = y_c / 1.0770;   // 段 1 逆式（前向 Y'c = 1.0770·Y'p）\n" \
-"  float y_p1 = (-2.7811 + sqrt(4.83307641 - 4.604 * y_c)) / -2.302;   // 段 2 逆式（前向二次段的代数逆）\n" \
-"  float y_p2 = (y_c - 0.5) / 0.5;   // 段 3 逆式（前向 Y'c = 0.5·Y'p + 0.5）\n" \
-"  float y_p;\n" \
-"  if (y_p0 <= 0.7399) y_p = y_p0;   // 段界 0.7399 / 0.9909（libplacebo 同值；标准自身段 1/2 交界有不连续 ~6e-4——对拍期望按同式复算，不假设严格单调）\n" \
-"  else if (y_p1 > 0.7399 && y_p1 < 0.9909) y_p = y_p1;\n" \
-"  else if (y_p2 >= 0.9909) y_p = y_p2;\n" \
-"  else y_p = y_p1;   // 段界浮点兜底（gamescope 同款：误差 <0.001）\n" \
-"  float p_hdr = 1.0 + 32.0 * pow(target_nits / 10000.0, 1.0 / 2.4);\n" \
-"  float y_ = (pow(p_hdr, y_p) - 1.0) / (p_hdr - 1.0);   // phdr 归一（Y'hdr）\n" \
-"  float col_scale = y_ > 0.0 ? y_sdr / (1.1 * y_) : 1.0;   // 保色调标量（gamescope else 0 会得 0/0=NaN——恰黑本就该出黑，兜底 1.0 后黑→黑精确）\n" \
-"  float3 o;\n" \
-"  o.b = cb * kB / col_scale + y_;   // 色度按 col_scale 重建（逆方向除）\n" \
-"  o.r = cr * kR / col_scale + y_;\n" \
-"  o.g = (y_ - (k2020.r * o.r + k2020.b * o.b)) / k2020.g;   // 亮度逆推 G'（白仍是白）\n" \
-"  return pow(clamp(o, float3(0.0), float3(1.0)), float3(2.4));   // saturate 后回线性\n" \
-"}\n"
 NSString *const k_present_msl = @
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
@@ -300,38 +267,20 @@ NSString *const k_present_msl = @
 // 有理肩部：膝点 k 以上、最亮通道 m 向 target t 压缩，各通道同缩放保色相（线性光、目标基色、无负值）。
 // 膝点处斜率 1、单调升、源峰 s 精确落 t（s ≤ t 时只在 t 截断）；每像素一次除法
 "static inline float3 present_shoulder(float3 n, float k, float t, float s) {\n"
-"  float m = max(max(n.r, n.g), n.b);\n"
-"  if (!(m > k)) return n;\n"
-"  float a = t - k, x = m - k, f = min(k + x / (1.0 + x * (1.0 / a - 1.0 / max(s - k, a))), t);\n"
-"  return n * (f / m);\n"
+"    float m = max(max(n.r, n.g), n.b);\n"
+"    if (!(m > k)) return n;\n"
+"    float a = t - k, x = m - k, f = min(k + x / (1.0 + x * (1.0 / a - 1.0 / max(s - k, a))), t);\n"
+"    return n * (f / m);\n"
 "}\n"
-// PR-A（#625 第二阶段）：S4「SDR 转 HDR」扩张曲线 present_itm 的 MSL 文本（K_GAL_ITM_MSL——上方定义；与直连副本
-//   nvn_mtl.m 同式〔「数学逐条对齐……两处同改」惯例、勘误与登记注释同在宏定义处〕，独立导出 k_present_itm_msl）
-K_GAL_ITM_MSL
 "fragment float4 pr_fs_hdr(VO in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant HP &p [[buffer(0)]]) {\n"
 "    float4 v = float4(t.sample(s, in.uv).rgb, 1.0);\n"
 "    if (p.mode.x > 3.5) {   // 4：PQ 层无 metadata——游戏可能画过屏当前净空的，膝点码值（xf.y）以上压进屏峰（mode.w）\n"
 "        if (max(max(v.r, v.g), v.b) > p.xf.y) v.rgb = present_linear_to_pq(present_shoulder(present_pq_to_linear(v.rgb, 1.0), p.mode.z, p.mode.w, p.xf.x), 1.0);\n"
 "    } else if (p.mode.x > 2.5) {   // 3：float 源（线性 BT.709）按纸白编成 HDR10；负值在矩阵后才截断，scRGB 的广色域保住其 BT.2020 值\n"
 "        v = float4(present_linear_to_pq(max(kRec709To2020 * clamp(v.rgb, -65504.0, 65504.0), 0.0), p.mode.y), 1.0);\n"
-// PR-A（#625 第二阶段）：mode 2 参数化扩展——S4「SDR 转 HDR」扩张（BT.2446A 逆映射 present_itm；矩阵提前到曲线之前——
-//   BT.2446A 的 Y'CbCr 变换按 BT.2020 设计，扩张必须在 709→2020 矩阵之后）。p.mode.z = sdr nits（p[2]）、
-//   p.mode.w = target nits（p[3]）——双零 = 不扩张（off 判定，nvn_hdr_policy.h hdr_present_fill 的 engage 门；
-//   HP 槽位与直连 Crop 一一对应）。engage 守卫 p.mode.z > 0.0 && p.mode.w > p.mode.z——严格大于：target ≤ sdr 会
-//   压暗/重塑（设计稿 §2.2 实测），绝不进曲线。未 engage 路径与改前同一式、同一输入、同一求值次序（仅中间量命名）——
-//   逐字节一致（off 不变量；gal 的 mode 0 平凡直通不经本变体，off 路径零触碰）。
-"    } else if (p.mode.x > 1.5) {\n"
-"      float3 lin2 = kRec709To2020 * present_sdr_to_linear(v.rgb, p.xf.z);\n"
-"      if (p.mode.z > 0.0 && p.mode.w > p.mode.z)\n"
-"        lin2 = present_itm(lin2, p.mode.z, p.mode.w) * (p.mode.w / p.mode.y);\n"   // 扩张：1.0=sdr nits 入 → 1.0=target nits 出 → 纸白相对域
-"      v = float4(present_linear_to_pq(lin2, p.mode.y), 1.0);\n"
-"    }\n"
+"    } else if (p.mode.x > 1.5) v = float4(present_linear_to_pq(kRec709To2020 * present_sdr_to_linear(v.rgb, p.xf.z), p.mode.y), 1.0);   // 2：SDR 源按纸白编成 HDR10（gal 主路：SDR 定格 → PQ 层）\n"
 "    else if (p.mode.x > 0.5) v = float4(present_linear_to_sdr(saturate(present_shoulder(max(kRec2020To709 * present_pq_to_linear(v.rgb, p.mode.y), 0.0), p.mode.z, p.mode.w, p.xf.x)), p.xf.z), 1.0);   // 1：先矩阵后肩部——BT.709 后压缩，保高光层次与色相\n"
 "    return v; }\n";
-// PR-A（#625 第二阶段）：present_itm 文本独立导出（与 k_present_msl 拼进 pr_fs_hdr 的同一份——上方 K_GAL_ITM_MSL）。
-//   单测独立判据（PR #2080 评审第 1 轮，graphics/metal/tests/t_present_hdr.m ⑦）经 dlsym 按名取它编探针着色器上 GPU
-//   直测 present_itm 本体（RGBA32F 线性直出，不经 PQ 10 位量化）——探针测的就是生产文本，不是手抄副本。
-NSString *const k_present_itm_msl = @K_GAL_ITM_MSL;
 typedef struct { int32_t org[2], size[2], flip[2], tmax[2]; } cap_params;
 
 static id<MTLLibrary> g_plib;
@@ -922,7 +871,7 @@ NXGAL_API void nxgal_present(uint32_t tex, const nxgal_crop *crop) { nxgal_pool_
         }
         pthread_mutex_lock(&g_mu);
         sl->frame = g_gp_frame - 1; sl->t_sig = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); sl->aa = antialiasing;
-        sl->fence = v; sl->stretched = c.stretched != 0; sl->ax = c.aspect_x; sl->ay = c.aspect_y;
+        sl->fence = v; sl->stretched = force_stretch() || c.stretched != 0; sl->ax = c.aspect_x; sl->ay = c.aspect_y;
         // 加宽（画幅线）生效时游戏出图本身就比 Ryujinx 呈现参数的宽高比（缺省 16:9）宽：按出图源矩形的像素宽高比等比铺（与屏同比即铺满）。
         // 10-19 iPhone 动森出图 1564x720（2.17）被按 16:9 信箱成 2346/2868 宽、两边黑边。比呈现参数窄或相等时照旧（横向缩放渲染的游戏源矩形比显示窄，按源比会压扁）；不用拉伸
         if (!sl->stretched && sl->ax > 0 && sl->ay > 0 && cw > 0 && ch > 0 && (float)cw * sl->ay > (float)ch * sl->ax * 1.01f) { sl->ax = (float)cw; sl->ay = (float)ch; }
