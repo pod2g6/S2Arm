@@ -23,6 +23,11 @@ jobs:
           sudo xcode-select -s /Applications/Xcode.app
           xcodebuild -version
 
+      - name: 装 dav1d / 渲染依赖（meson、ninja、nasm）
+        run: |
+          brew install meson ninja nasm pkg-config || brew upgrade meson ninja nasm pkg-config
+          meson --version && ninja --version && nasm -v
+
       - name: 编译 iOS 壳（未签名）
         run: make ios -j"$(sysctl -n hw.ncpu)"
 
