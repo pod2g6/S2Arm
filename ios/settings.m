@@ -465,6 +465,19 @@ void s2a_ios_apply_graphics_settings(NSUserDefaults *defaults) {
             if (!getenv("S2A_WIDESCREEN")) apply_environment("S2A_WIDESCREEN", @"1");
             fprintf(stderr, "[S2A 画面设置] 满屏：这款明确开（没进已验证名单也铺满，自检兜底）\n");
         }
+        // 拉伸铺满（launch.json stretchToFill，按款）：上屏层把画面几何拉伸到整块屏幕，不按游戏给的 16:9 等比留边，
+        //   比例不对会变形，换的是「没有黑边」。用 setenv(…, 1) 覆盖：apply_environment 是「启动环境显式给的优先」，
+        //   这一项只该由这款游戏的设置说了算；写进 settings_environment 让 App 设置页读到的是生效值。
+        // 和满屏互斥：满屏是「按屏幕比例加宽渲染」，叠在一起会先加宽再拉伸、变形两遍，所以开拉伸就把宽屏关掉。
+        if ([game objectForKey:@"S2AStretchToFill"]) {
+            BOOL st = [game boolForKey:@"S2AStretchToFill"];
+            if (st) {
+                setenv("S2A_STRETCH", "1", 1); setenv("S2A_WIDESCREEN", "0", 1);
+                if (!settings_environment) settings_environment = [NSMutableDictionary new];
+                settings_environment[@"S2A_STRETCH"] = @"1"; settings_environment[@"S2A_WIDESCREEN"] = @"0";
+                fprintf(stderr, "[S2A 画面设置] 拉伸铺满：开（几何拉伸到整屏，满屏已让开）\n");
+            }
+        }
     }
     // 宽屏（runtime/src/widen.c widen_setting_on）：设置关了 = S2A_WIDESCREEN=0，下次启动整局 16:9；没设过 / 开着不设（缺省开）；启动环境显式给的优先
     // 一次性清记忆（11-06 满屏自检改「两次启动都触发才记住」）：之前单次触发就写下的「宽屏关 + 问过」清掉，下次起局重新试满屏、重新自检。
